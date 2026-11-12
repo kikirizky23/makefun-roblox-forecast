@@ -156,3 +156,158 @@ probabilities, not a different top 10.
   is unknown, so beating the baseline does not guarantee a prize. The
   forecast is calibrated, not overconfident, which is the best available
   posture against an unknown house model.
+
+## 9. v2 (13 Nov 2026, ~06:30–07:30 WIB) — measured improvements
+
+**Why:** the v1 entry is live but ranked 705 of 2,416+ agents (dev log
+score −35.0545); the $500 prize pays the top 20, so v1 needed a real
+improvement, not a marginal tweak. Entries close 13 Nov 2026 13:00 WIB.
+
+**New data first.** The public archive
+(github.com/Kenny-Dhub/roblox-snapshots) has snapshots through
+2026-11-12T18:57Z. Fetched the 7 post-practice reads (11-10 → 11-12) via
+the GitHub API contents endpoint (raw.githubusercontent times out here)
+→ `~/workspace/make-fun/roblox-v2/tests/extended_answer.json`. Full
+history for v2 validation: kit 34 reads + practice 10 + extended 7 =
+**51 reads, 2026-10-30 → 2026-11-12**. Expanded harness
+(`~/workspace/make-fun/roblox-v2/tests/exp.py`): 15 rolling cuts
+(train on reads [0..k), score the next 10 reads, k = 12, 14, …, 40) +
+the practice window + a recent 7-read window (train to 11-10, score
+11-10 → 11-12). v1 on this harness: **mean −38.404, practice −34.712,
+recent −37.706** (baseline mean −47.787). All v2 decisions are made on
+the 15-cut mean, with practice + recent as guards against overfitting a
+single window.
+
+**Diagnostics that shaped v2.**
+- Oracle marginal (exact future per-place frequencies on the practice
+  window): **−13.179** vs v1 −34.712 — ~21 nats of headroom, but the
+  oracle is unachievable; it bounds the problem, not the target.
+  Per-place oracle entropy 0.8–1.83 nats (3–7 distinct games per place)
+  vs v1 typical p 0.031 (~32 games) — v1 is far too diffuse *in the
+  wrong places*, but see the temperature result below.
+- Feature correlations (conditional on current rank, practice window):
+  time-on-chart/age +0.161 at 24 h (older games decline); top_trending
+  rank −0.092; playing share −0.079; top_playing_now ~0 overall but a
+  split test (ranks 6–15) showed P(top10 later) 0.60 vs 0.39 on it.
+- New-entrant share in the top 10: 11.6% across cuts, 8% practice,
+  2.9% recent. v1's unnamed mass (~0.13/place, capped at 0.88 named)
+  already matches that rate — the tail calibration is right, so the
+  lever is ranking *within* the named set, not the tail.
+- The archive carries `playing` in every chart row and
+  `top_trending` / `top_playing_now` on all 51 reads; `details` always
+  null (archive source).
+
+**What was tested and what happened** (all on the 15-cut mean;
+practice / recent in brackets; v1 = −38.404 / −34.712 / −37.706).
+- Temperature sharpening (global γ = 1.2/1.4/1.7/2.0): mean *worse*
+  (−38.53 at γ 1.2, −41.30 at γ 2.0) even though practice improved
+  slightly at γ 1.2. **Rejected** — the kernel's diffuseness is honest
+  uncertainty, not miscalibration.
+- Per-place temperature (sharpen places 1–3 only): mean tied at best
+  (−37.57 at γ 1.2) but practice worse. **Rejected.**
+- Age drift (ranks/day added to r_eff): 0.5 → −38.51, 1.0 → −40.10
+  (too strong), but **0.1 → −38.25 and 0.2 → −38.34** — small and
+  consistent. **Kept at 0.2** (jointly re-tuned, see below).
+- Playing-growth (log playing ratio over 24 h, ranks subtracted):
+  0.5 → −38.39, 1.0 → −38.33, **2.0 → −38.13, 4.0 → −37.92**,
+  6.0 → −38.18. 12 h window worse. **Kept at 4.0 / 24 h** — the
+  strongest single new signal. (Note: v1's "growth does not predict"
+  conclusion was an unconditional linear correlation; as a conditional
+  rank offset inside the kernel it helps — the A/B is the arbiter.)
+- Top-playing-now bonus (1/2/3 ranks, all ranks or borderline 6–15
+  only): all worse (−38.54 to −38.82). **Rejected.**
+- Top-trending bonus, playing-share level: all worse. **Rejected.**
+- Windowed velocity (12 h / 24 h instead of last interval): worse.
+  **Rejected.** Recency half-life 2 d worse, 7 d tied. **Kept 4 d.**
+- New-game offset (±1/±2 ranks for games first seen < 1 day): worse.
+  **Rejected.** END_SMOOTH 0.15/0.0 and PLACE_CAP 0.95: worse.
+  **Rejected.**
+- Asymmetric velocity shrink (on top of growth 4 + age 0.2): rise
+  0.2 / fall 0.8 → **−37.570** (rise 0.2 / fall 0.6 → −37.638;
+  rise 0.3 / fall 0.8 → −37.565; symmetric 0.40 → −37.764). A rise
+  mean-reverts, a fall persists. **Kept at rise 0.2 / fall 0.8**
+  (the 0.2/0.3-rise difference is noise; 0.2 has the better practice
+  and recent scores).
+- Joint re-tune (growth × age with asymmetric velocity): growth 4.0 /
+  age 0.3 → −37.567, growth 4.0 / age 0.2 → **−37.570**,
+  growth 2.0 / age 0.2 → −37.677. **Final: growth 4.0, age 0.2.**
+
+**Final v2 constants** (in `main.py`, § "v2 (measured, kept)"):
+`AGE_DRIFT = 0.2`, `GROWTH_COEF = 4.0`, `GROWTH_WINDOW_HOURS = 24.0`,
+`VEL_RISE_SHRINK = 0.2`, `VEL_FALL_SHRINK = 0.8`. Everything else is
+v1's. `load_history` now also captures per-read `playing` and the
+`top_playing_now` / `top_trending` ranks, and records `FIRST_SEEN`
+(first appearance in the history) for the age feature.
+
+**Final v2 numbers** (verified on the shipped `main.py`):
+| window | v1 | v2 | gain |
+|---|---|---|---|
+| 15-cut backtest mean | −38.404 | **−37.570** | +0.834 |
+| practice window | −34.712 | **−34.531** | +0.181 |
+| recent 7-read window | −37.706 | **−37.352** | +0.354 |
+| (house baseline, 15-cut mean) | −47.787 | — | v2 is +10.22 over baseline |
+
+Per-cut v2 (vs v1): 12: −37.29 (−39.35), 14: −36.72 (−37.71),
+16: −38.83 (−41.72), 18: −36.03 (−36.14), 20: −41.34 (−40.71),
+22: −40.87 (−40.84), 24: −42.68 (−44.17), 26: −36.44 (−38.29),
+28: −35.00 (−36.42), 30: −34.26 (−36.41), 32: −36.33 (−37.65),
+34: −34.77 (−35.08), 36: −35.19 (−35.13), 38: −37.48 (−37.91),
+40: −40.32 (−38.55). v2 wins 10 of 15 cuts; the losses (18, 20, 36,
+40) are the windows where the chart moved least or the growth signal
+misfired — the wins are larger than the losses.
+
+**Verification of the shipped file** (kit input, `main.py` run twice):
+- Runtime 0.17–0.18 s; two runs byte-identical (deterministic).
+- Output format identical to v1: exactly two keys (`probabilities`,
+  `top10`), 649 rows, per-place named mass 0.83–0.88 (capped), all
+  p in (0, 1], rows sorted by place then −p, top10 exactly 10 distinct
+  ids.
+- No network, stdlib only, same input/output contract as v1.
+
+**Honest caveat for the parent:** this is a real, measured improvement
+(+0.83 nats on the 15-cut mean, +0.18 practice, +0.35 recent), but it
+is NOT the "big jump" the live rank (705 of 2,416+, dev −35.05) would
+need to reach the top 20 on its own. The evidence is consistent that
+most of the oracle gap (~21 nats) is irreducible churn — new games,
+random rank movement, and the kernel already being well calibrated
+(temperature, tail, and cap changes all failed). The three kept
+features are genuine predictive signal, each validated on held-out
+windows, and they do not overfit the practice window (the mean, not
+practice, drove the decisions). If the final window behaves like the
+backtests, v2 should score ~0.5–1 nat better than v1; whether that
+moves the rank materially depends on how tightly packed the field is
+around rank 705, which is unknowable from here.
+
+**Work files:** `~/workspace/make-fun/roblox-v2/` — `v2exp.py`
+(experiment module), `tests/exp.py` (expanded harness), `tests/postproc.py`
+(temperature/cap), `tests/feat.py` + `tests/feat2.py` (feature A/B),
+`tests/combo.py`, `tests/joint.py`, `tests/velgrid.py`,
+`tests/placetemp.py`, `tests/diag.py` + `tests/diag3.py`,
+`tests/fetch_extended.py`, `tests/extended_answer.json`,
+`tests/practice_answer.json` (copied from the v1 tests).
+
+## 10. Notes for resubmission (parent agent)
+
+- This is a **resubmission** of the existing repo
+  https://github.com/kikirizky23/makefun-roblox-forecast (v1 HEAD
+  af80b01b706163d136229eefe3c3d57b1b72294b): update `main.py`,
+  `README.md`, `BUILD_LOG.md` in place, keep `.makefun/owner.json`
+  untouched, new commit on top. Do NOT create a new repo.
+- Transcript bundle: include **both** sessions — the v1 build session
+  (3c42713d-1450-4467-91cc-27e6977bf2f0, 69 turns) AND this v2 session
+  (5bde63e7-b15f-401b-8017-818a444c575d). The v2 session wrote/edited
+  `main.py`, `README.md` and `BUILD_LOG.md` with the write/edit tools
+  in substantial edits, and the v1 session authored the rest — together
+  they cover the shipped code (the chess lesson: a bundle with only one
+  session failed the 30% transcript-coverage gate). Use both usage rows
+  from muse.db. Same kit CLI, `--no-discover --no-family`, harness Muse,
+  model ipnext/avocado-5.17-v2, same redactions as the art bundles.
+- This bounty is escrowed ($500), so the resubmission needs Rizki's
+  Phantom "Sign and submit" (wallet 698w…JoET) — or confirm whether he
+  wants to submit it himself (he submitted v1 himself at 03:17 WIB) or
+  wants the agent to submit it like chess. **Entries close 13 Nov 2026
+  13:00 WIB** — the resubmission must land before then; the most recent
+  submission before the deadline is the final entry.
+- The v1 entry is already live (dev score −35.0545, rank 705). If the
+  resubmission fails its checks, the v1 entry stands — resubmitting does
+  not delete v1 unless the new one is accepted.

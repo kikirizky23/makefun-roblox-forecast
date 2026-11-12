@@ -25,13 +25,22 @@ forecasts a **time-averaged marginal**, not one predicted order:
    rank at *t + h* — binned by starting rank and gap, smoothed over
    neighbouring bins, weighted toward recent reads. The kernel captures
    drift, diffusion and dropout (leaving the chart) in one object, with no
-   parametric assumption. Player-count growth does *not* predict rank
-   changes (correlation ≈ 0 in the history), so it is deliberately not used.
+   parametric assumption. **v2 adds three measured features on top of the
+   kernel** (each validated on the expanded 15-cut backtest; see
+   BUILD_LOG §9): an asymmetric velocity shrink (a rise mean-reverts,
+   shrink 0.2; a fall persists, shrink 0.8), a small age drift (+0.2 ranks
+   per day of time-on-chart), and a playing-growth term (−4.0 ranks per
+   unit of log concurrent-player growth over the last 24 h). Note the
+   correction to the v1 note: the *unconditional* correlation of
+   log-playing-growth with rank change is ≈ 0, but as a conditional rank
+   offset inside the kernel the growth term still improves the held-out
+   score — the effect is concentrated in surging games, not linear across
+   all of them, so the A/B (not the correlation) is the arbiter.
 2. **Time averaging.** Each candidate game's kernel is averaged over
    horizons spanning the scored window (uniform: the score is the mean over
    the window's hourly reads), with a small, heavily damped velocity
-   adjustment — the last-interval rank velocity, shrunk and saturating over
-   ~8 hours (one-step velocity correlation is only ~0.21).
+   adjustment — the last-interval rank velocity, saturating over ~8 hours
+   (one-step velocity correlation is only ~0.21).
 3. **Age-out taper.** A game whose Roblox `created` date puts it past the
    chart's 28-day age limit inside the window is tapered out after that
    time (when `details` are present in the history).
@@ -57,7 +66,7 @@ MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 
 In the grader's container it runs as `python3 /bot/main.py`, reading
 `/input` and writing `/output/forecast.json`. Runtime on the kit's practice
-history is ~0.3 s; on a synthetic 150-read hourly history, ~0.7 s — far
+history is ~0.2 s; on a synthetic 150-read hourly history, ~0.7 s — far
 inside the 300 s / 1 CPU / 1024 MB limits. Two runs on the same history
 produce byte-identical output.
 
@@ -65,10 +74,12 @@ produce byte-identical output.
 
 - Practice window (reconstructed from the public archive, verified by
   reproducing the house baseline's published score **exactly**,
-  −43.512039): this forecaster scores **−34.712** — 8.8 nats better than
-  the house baseline, typical probability 0.031 per place vs 0.013.
-- Rolling-origin backtests on the kit history (4 cuts): mean **−38.34**
-  vs baseline −45.00.
+  −43.512039): v2 scores **−34.531** (v1: −34.712) — 8.98 nats better
+  than the house baseline.
+- Expanded rolling-origin backtests (15 cuts over 51 archive reads,
+  2026-10-30 → 2026-11-12): v2 mean **−37.57** vs v1 −38.40 vs baseline
+  −47.79. A recent 7-read window (train to 11 Nov, score 11–12 Nov):
+  v2 **−37.35** vs v1 −37.71.
 - Format, determinism, edge cases (empty / 1-read / malformed / missing
   `task.json` / no games) and a 150-read stress test all pass.
 

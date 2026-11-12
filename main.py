@@ -22,7 +22,13 @@ time-averaged marginal, not a single predicted order:
 2. For each candidate game, average that kernel over horizons h spanning the
    scored window (uniform: the score is the mean over the window's hourly
    reads), with a small, heavily damped velocity adjustment (last-interval
-   rank velocity, shrunk by ~0.21 and saturating over ~8 h).
+   rank velocity, saturating over ~8 h). v2 makes the velocity shrink
+   asymmetric -- a rise mean-reverts (shrink 0.2) while a fall persists
+   (shrink 0.8) -- and adds two measured feature offsets to the effective
+   rank: +0.2 ranks per day of time-on-chart (older games drift down) and
+   -4.0 ranks per unit of log playing growth over the last 24 h (a game
+   whose concurrent players are surging rises). Together these move the
+   15-cut backtest mean from -38.40 (v1) to -37.57.
 3. Games whose Roblox `created` date puts them past the chart's 28-day age
    limit inside the window are tapered out after that time.
 4. Per place, the probabilities are the averaged kernel marginals, capped so
@@ -58,6 +64,30 @@ END_SMOOTH = 0.30           # blur over neighbouring ending ranks (fixes
                             # lumpiness from small per-cell samples)
 MAX_ROWS_PER_PLACE = 100    # format limit
 AGE_LIMIT_DAYS = 28.0       # chart only lists games published < 28 days ago
+
+# ------------------------------------------------- v2 (measured, kept)
+# v2 adds three features on top of the v1 kernel, each validated on an
+# expanded backtest (15 rolling cuts over 51 archive reads, 2026-10-30 ..
+# 2026-11-12, plus the practice window and a recent 7-read window). The
+# three together move the 15-cut mean from -38.40 (v1) to -37.57, the
+# practice window from -34.71 to -34.53, and the recent window from -37.71
+# to -37.35 (log score, higher is better; house baseline mean -47.79).
+# Rejected after measurement (all made the mean worse, so they are NOT
+# here): temperature sharpening (global or per-place), top-playing-now /
+# top-trending rank bonuses, playing-share level, windowed (12h/24h)
+# velocity, shorter recency half-life, new-game offsets, END_SMOOTH and
+# PLACE_CAP changes.
+AGE_DRIFT = 0.2             # ranks/day of time-on-chart added to r_eff:
+                            # older games drift to worse ranks (small but
+                            # consistent: 0.1-0.2 helps, 0.5+ hurts)
+GROWTH_COEF = 4.0           # ranks subtracted per unit of log playing
+                            # growth over GROWTH_WINDOW_HOURS: a game whose
+                            # concurrent-player count is surging rises
+GROWTH_WINDOW_HOURS = 24.0  # window for the playing-growth feature
+VEL_RISE_SHRINK = 0.2       # velocity shrink for rising games (v < 0):
+                            # a rise mean-reverts, so trust it less
+VEL_FALL_SHRINK = 0.8       # velocity shrink for falling games (v > 0):
+                            # a fall persists, so trust it more
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
@@ -145,8 +175,38 @@ def load_history(input_dir):
                     if rank >= 1 and uid not in ranks:
                         ranks[uid] = rank
                 if ranks:
+                    # v2: keep the per-read playing counts and the two
+                    # companion charts (Top Playing Now / Top Trending) --
+                    # the growth feature reads them from the last read.
+                    playing = {}
+                    for row in chart:
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            puid = int(row["universe_id"])
+                            playing[puid] = float(row.get("playing") or 0.0)
+                        except Exception:
+                            continue
+                    tpn = {}
+                    for row in (snap.get("top_playing_now") or []):
+                        if isinstance(row, dict):
+                            try:
+                                tpn[int(row["universe_id"])] = int(row["rank"])
+                            except Exception:
+                                continue
+                    tt = {}
+                    for row in (snap.get("top_trending") or []):
+                        if isinstance(row, dict):
+                            try:
+                                tt[int(row["universe_id"])] = int(row["rank"])
+                            except Exception:
+                                continue
                     reads.append({"t": t, "chart": ranks,
-                                  "size": len(ranks)})
+                                  "size": len(ranks), "playing": playing,
+                                  "tpn": tpn, "tt": tt})
+                    for uid in ranks:
+                        if uid not in FIRST_SEEN:
+                            FIRST_SEEN[uid] = t
                 # keep created dates when a read carries details
                 det = snap.get("details")
                 if isinstance(det, dict):
@@ -162,6 +222,10 @@ def load_history(input_dir):
 
 
 CREATED = {}  # universe_id -> created epoch seconds (filled by load_history)
+FIRST_SEEN = {}  # universe_id -> first-seen epoch seconds in this history
+# (v2 age feature: time-on-chart = t_last - FIRST_SEEN[uid]; left-censored
+# for games already on the chart when the history starts, which only adds a
+# common offset to them, so the relative ages still carry the signal)
 
 
 # ------------------------------------------------------------------- kernel
@@ -357,6 +421,47 @@ def forecast(reads, task):
             if 0 < dt <= 24.0:
                 velocity[uid] = (r2 - r1) / dt
 
+    # v2 per-game feature offsets (constant over horizons; added to r_eff).
+    # (a) Age drift: a game that has been on the chart longer drifts to a
+    #     worse rank, ~0.2 ranks per day of time-on-chart. The effect is
+    #     small but consistent across the 15-cut backtest (0.1-0.2 helps,
+    #     0.5+ hurts); it is a survivorship/turnover effect, not a claim
+    #     that old games are bad -- the kernel already prices in their
+    #     stickiness, this is the residual drift.
+    # (b) Playing growth: a game whose concurrent-player count surged over
+    #     the last 24 h (log ratio) is rising; subtract GROWTH_COEF per unit
+    #     of log growth from its effective rank. This was the single
+    #     strongest new signal (mean -38.40 -> -37.92 at coef 4 alone).
+    # Both are computed from the last read and the reads' playing series;
+    # games without a playing series simply get no growth term.
+    features = {}
+    growth = {}
+    target = t_last - GROWTH_WINDOW_HOURS * 3600.0
+    for uid in pool:
+        pts = []
+        for rd in reads:
+            p = (rd.get("playing") or {}).get(uid)
+            if p is not None:
+                pts.append((rd["t"], p))
+        if len(pts) >= 2:
+            base = None
+            for pt in pts:
+                if pt[0] >= target:
+                    base = pt
+                    break
+            if base is None:
+                base = pts[0]
+            p0, p1 = base[1], pts[-1][1]
+            if p0 and p1 and (pts[-1][0] - base[0]) >= 6.0 * 3600.0:
+                growth[uid] = math.log(p1 / p0)
+    for uid in pool:
+        off = 0.0
+        age_days = (t_last - FIRST_SEEN.get(uid, t_last)) / 86400.0
+        off += AGE_DRIFT * age_days
+        if uid in growth:
+            off -= GROWTH_COEF * growth[uid]
+        features[uid] = off
+
     hist, centers = build_kernel(reads)
 
     # per-game, per-place probabilities (averaged over horizons)
@@ -366,10 +471,20 @@ def forecast(reads, task):
         probs = [0.0] * places
         for h in horizons:
             hh = h + age  # dropouts have already been drifting
-            # damped velocity drift, saturating over VELOCITY_TAU
-            drift = (v * VELOCITY_SHRINK * VELOCITY_TAU *
+            # damped velocity drift, saturating over VELOCITY_TAU.
+            # v2: asymmetric shrink -- a rise mean-reverts (trust it less,
+            # shrink 0.2) while a fall persists (trust it more, shrink 0.8).
+            # Measured on the 15-cut backtest: symmetric 0.40 gives mean
+            # -37.76 on top of growth+age; asymmetric 0.2/0.8 gives -37.57.
+            shrink = VELOCITY_SHRINK
+            if v:
+                if v < 0:
+                    shrink = VEL_RISE_SHRINK
+                else:
+                    shrink = VEL_FALL_SHRINK
+            drift = (v * shrink * VELOCITY_TAU *
                      (1.0 - math.exp(-hh / VELOCITY_TAU))) if v else 0.0
-            r_eff = min(max(r0 + drift, 1.0), 200.0)
+            r_eff = min(max(r0 + drift + features.get(uid, 0.0), 1.0), 200.0)
             dist = kernel_dist(hist, centers, r_eff, hh)
             if dist is None:
                 g = gauss_rank_dist(r_eff, hh)
